@@ -1,0 +1,71 @@
+name: Build CircuitPython + LVGL (Sunton 8048S050)
+
+on:
+  workflow_dispatch:
+    inputs:
+      cp_ref:
+        description: "CircuitPython tag/branch"
+        default: "11.0.0-alpha.2"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      BOARD: sunton_esp32_8048S050
+
+    steps:
+      - name: Checkout CircuitPython
+        uses: actions/checkout@v4
+        with:
+          repository: adafruit/circuitpython
+          ref: ${{ inputs.cp_ref }}
+          path: circuitpython
+          fetch-depth: 0        # 版本号依赖 git tag
+
+      - name: Checkout omnipython-lvgl
+        uses: actions/checkout@v4
+        with:
+          repository: PyDevices/omnipython-lvgl
+          path: omnipython-lvgl
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gettext cmake ninja-build ccache libusb-1.0-0
+
+      - name: Cache ESP-IDF tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.espressif
+          key: idf-${{ inputs.cp_ref }}
+
+      - name: Fetch espressif submodules
+        run: make -C circuitpython/ports/espressif fetch-port-submodules
+
+      - name: Install ESP-IDF + Python deps
+        run: |
+          cd circuitpython
+          pip install -r requirements-dev.txt
+          ./ports/espressif/esp-idf/install.sh esp32s3
+
+      - name: Build
+        run: |
+          cd circuitpython
+          source ports/espressif/esp-idf/export.sh
+          pip install -r requirements-dev.txt
+          make -C ports/espressif -j$(nproc) \
+            BOARD=$BOARD \
+            CIRCUITPY_GIFIO=0 \
+            USER_C_MODULES=$GITHUB_WORKSPACE/omnipython-lvgl/ports/circuitpython
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: circuitpython-lvgl-${{ env.BOARD }}
+          path: circuitpython/ports/espressif/build-${{ env.BOARD }}/firmware.*
