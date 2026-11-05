@@ -13,6 +13,9 @@ jobs:
     timeout-minutes: 120
     env:
       BOARD: sunton_esp32_8048S050
+    defaults:
+      run:
+        shell: bash          # 显式指定后默认带 -eo pipefail
 
     steps:
       - name: Checkout CircuitPython
@@ -21,7 +24,7 @@ jobs:
           repository: adafruit/circuitpython
           ref: ${{ inputs.cp_ref }}
           path: circuitpython
-          fetch-depth: 0        # 版本号依赖 git tag
+          fetch-depth: 0
 
       - name: Checkout omnipython-lvgl
         uses: actions/checkout@v4
@@ -46,7 +49,11 @@ jobs:
           key: idf-${{ inputs.cp_ref }}
 
       - name: Fetch espressif submodules
-        run: make -C circuitpython/ports/espressif fetch-port-submodules
+        run: |
+          for i in 1 2 3; do
+            make -C circuitpython/ports/espressif fetch-port-submodules && break
+            echo "retry $i"; sleep 10
+          done
 
       - name: Install ESP-IDF + Python deps
         run: |
@@ -62,7 +69,32 @@ jobs:
           make -C ports/espressif -j$(nproc) \
             BOARD=$BOARD \
             CIRCUITPY_GIFIO=0 \
-            USER_C_MODULES=$GITHUB_WORKSPACE/omnipython-lvgl/ports/circuitpython
+            USER_C_MODULES=$GITHUB_WORKSPACE/omnipython-lvgl/ports/circuitpython \
+            2>&1 | tee $GITHUB_WORKSPACE/build.log
+
+      - name: Show errors
+        if: failure()
+        run: |
+          grep -nE "error:|Error [0-9]|overflow|too small|No such file|undefined reference|multiple definition" \
+            build.log | head -50 || true
+
+      - name: Rebuild single-thread to show error
+        if: failure()
+        run: |
+          cd circuitpython
+          source ports/espressif/esp-idf/export.sh
+          make -C ports/espressif -j1 \
+            BOARD=$BOARD \
+            CIRCUITPY_GIFIO=0 \
+            USER_C_MODULES=$GITHUB_WORKSPACE/omnipython-lvgl/ports/circuitpython \
+            2>&1 | tail -80
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
