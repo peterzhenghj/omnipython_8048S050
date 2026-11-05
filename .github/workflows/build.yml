@@ -6,16 +6,23 @@ on:
       cp_ref:
         description: "CircuitPython tag/branch"
         default: "11.0.0-alpha.2"
+      lvgl_ref:
+        description: "omnipython-lvgl branch/tag/commit"
+        default: "main"
+      jobs:
+        description: "make -j (失败排查时改为 1)"
+        default: "4"
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 150
     env:
       BOARD: sunton_esp32_8048S050
+      LVGL_MOD: ${{ github.workspace }}/omnipython-lvgl/ports/circuitpython
     defaults:
       run:
-        shell: bash          # 显式指定后默认带 -eo pipefail
+        shell: bash   # 默认 -eo pipefail
 
     steps:
       - name: Checkout CircuitPython
@@ -30,6 +37,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: PyDevices/omnipython-lvgl
+          ref: ${{ inputs.lvgl_ref }}
           path: omnipython-lvgl
           submodules: recursive
 
@@ -42,11 +50,42 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gettext cmake ninja-build ccache libusb-1.0-0
 
+      - name: Show omnipython-lvgl CI hints
+        run: |
+          echo "== omnipython-lvgl workflows =="
+          ls -la omnipython-lvgl/.github/workflows/ 2>/dev/null || echo "(none)"
+          echo "== circuitpython refs / patches mentioned =="
+          grep -rnE "adafruit/circuitpython|ref:|\.patch|git apply" \
+            omnipython-lvgl/.github/workflows/ omnipython-lvgl/ports/circuitpython/ 2>/dev/null | head -40 || true
+
+      - name: Apply omnipython-lvgl patches (if any)
+        run: |
+          cd circuitpython
+          shopt -s nullglob globstar
+          patches=()
+          for d in "$GITHUB_WORKSPACE/omnipython-lvgl/ports/circuitpython" \
+                   "$GITHUB_WORKSPACE/omnipython-lvgl/patches" \
+                   "$GITHUB_WORKSPACE/omnipython-lvgl/ports/circuitpython/patches"; do
+            patches+=("$d"/*.patch "$d"/*.diff)
+          done
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "No patches found, skip."
+            exit 0
+          fi
+          for p in "${patches[@]}"; do
+            echo ">> applying $p"
+            git apply --check "$p" && git apply "$p" || { echo "!! failed: $p"; exit 1; }
+          done
+
+      - name: Inspect qstr pool limit
+        run: |
+          grep -nE "too large|assert False|pool" circuitpython/py/makeqstrdata.py | head -30
+
       - name: Cache ESP-IDF tools
         uses: actions/cache@v4
         with:
           path: ~/.espressif
-          key: idf-${{ inputs.cp_ref }}
+          key: idf-${{ runner.os }}-${{ inputs.cp_ref }}
 
       - name: Fetch espressif submodules
         run: |
@@ -66,28 +105,19 @@ jobs:
           cd circuitpython
           source ports/espressif/esp-idf/export.sh
           pip install -r requirements-dev.txt
-          make -C ports/espressif -j$(nproc) \
+          make -C ports/espressif -j${{ inputs.jobs }} \
             BOARD=$BOARD \
             CIRCUITPY_GIFIO=0 \
-            USER_C_MODULES=$GITHUB_WORKSPACE/omnipython-lvgl/ports/circuitpython \
+            USER_C_MODULES=$LVGL_MOD \
             2>&1 | tee $GITHUB_WORKSPACE/build.log
 
       - name: Show errors
         if: failure()
         run: |
-          grep -nE "error:|Error [0-9]|overflow|too small|No such file|undefined reference|multiple definition" \
-            build.log | head -50 || true
-
-      - name: Rebuild single-thread to show error
-        if: failure()
-        run: |
-          cd circuitpython
-          source ports/espressif/esp-idf/export.sh
-          make -C ports/espressif -j1 \
-            BOARD=$BOARD \
-            CIRCUITPY_GIFIO=0 \
-            USER_C_MODULES=$GITHUB_WORKSPACE/omnipython-lvgl/ports/circuitpython \
-            2>&1 | tail -80
+          grep -nE "error:|Error [0-9]|AssertionError|too large|overflow|too small|No such file|undefined reference|multiple definition" \
+            build.log | head -60 || true
+          echo "== qstr count =="
+          wc -l circuitpython/ports/espressif/build-$BOARD/genhdr/qstrdefs.preprocessed.h 2>/dev/null || true
 
       - name: Upload build log
         if: always()
@@ -97,7 +127,11 @@ jobs:
           path: build.log
 
       - name: Upload firmware
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: circuitpython-lvgl-${{ env.BOARD }}
-          path: circuitpython/ports/espressif/build-${{ env.BOARD }}/firmware.*
+          path: |
+            circuitpython/ports/espressif/build-${{ env.BOARD }}/firmware.bin
+            circuitpython/ports/espressif/build-${{ env.BOARD }}/firmware.uf2
+          if-no-files-found: warn
