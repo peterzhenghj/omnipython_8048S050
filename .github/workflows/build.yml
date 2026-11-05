@@ -5,12 +5,12 @@ on:
     inputs:
       cp_ref:
         description: "CircuitPython tag/branch"
-        default: "11.0.0-alpha.2"
+        default: "main"
       lvgl_ref:
         description: "omnipython-lvgl branch/tag/commit"
         default: "main"
       jobs:
-        description: "make -j (失败排查时改为 1)"
+        description: "make -j (排查时设为 1)"
         default: "4"
 
 jobs:
@@ -22,7 +22,7 @@ jobs:
       LVGL_MOD: ${{ github.workspace }}/omnipython-lvgl/ports/circuitpython
     defaults:
       run:
-        shell: bash   # 默认 -eo pipefail
+        shell: bash   # -eo pipefail
 
     steps:
       - name: Checkout CircuitPython
@@ -50,36 +50,42 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gettext cmake ninja-build ccache libusb-1.0-0
 
+      - name: Show versions
+        run: |
+          echo "CircuitPython: $(git -C circuitpython describe --tags --always)"
+          echo "omnipython-lvgl: $(git -C omnipython-lvgl rev-parse --short HEAD)"
+
       - name: Show omnipython-lvgl CI hints
         run: |
-          echo "== omnipython-lvgl workflows =="
-          ls -la omnipython-lvgl/.github/workflows/ 2>/dev/null || echo "(none)"
-          echo "== circuitpython refs / patches mentioned =="
-          grep -rnE "adafruit/circuitpython|ref:|\.patch|git apply" \
-            omnipython-lvgl/.github/workflows/ omnipython-lvgl/ports/circuitpython/ 2>/dev/null | head -40 || true
+          ls -la omnipython-lvgl/.github/workflows/ 2>/dev/null || echo "(no workflows)"
+          grep -rnE "adafruit/circuitpython|ref:|\.patch|git apply|makeqstrdata" \
+            omnipython-lvgl/.github/workflows/ omnipython-lvgl/ports/circuitpython/ 2>/dev/null \
+            | head -40 || true
 
       - name: Apply omnipython-lvgl patches (if any)
         run: |
           cd circuitpython
-          shopt -s nullglob globstar
+          shopt -s nullglob
           patches=()
           for d in "$GITHUB_WORKSPACE/omnipython-lvgl/ports/circuitpython" \
-                   "$GITHUB_WORKSPACE/omnipython-lvgl/patches" \
-                   "$GITHUB_WORKSPACE/omnipython-lvgl/ports/circuitpython/patches"; do
+                   "$GITHUB_WORKSPACE/omnipython-lvgl/ports/circuitpython/patches" \
+                   "$GITHUB_WORKSPACE/omnipython-lvgl/patches"; do
             patches+=("$d"/*.patch "$d"/*.diff)
           done
-          if [ ${#patches[@]} -eq 0 ]; then
-            echo "No patches found, skip."
-            exit 0
-          fi
+          [ ${#patches[@]} -eq 0 ] && { echo "No patches found, skip."; exit 0; }
           for p in "${patches[@]}"; do
             echo ">> applying $p"
-            git apply --check "$p" && git apply "$p" || { echo "!! failed: $p"; exit 1; }
+            git apply --check "$p" && git apply "$p"
           done
 
-      - name: Inspect qstr pool limit
+      - name: Dump makeqstrdata pool logic
         run: |
-          grep -nE "too large|assert False|pool" circuitpython/py/makeqstrdata.py | head -30
+          cd circuitpython
+          git log --oneline -3 -- py/makeqstrdata.py
+          echo "----- makeqstrdata.py 440-505 -----"
+          sed -n '440,505p' py/makeqstrdata.py
+          echo "----- qstr.h / qstr.c -----"
+          grep -rnE "QSTR_POOL|qstr_pool|MICROPY_QSTR_BYTES|total_qstr" py/qstr.h py/qstr.c | head -20 || true
 
       - name: Cache ESP-IDF tools
         uses: actions/cache@v4
@@ -116,8 +122,6 @@ jobs:
         run: |
           grep -nE "error:|Error [0-9]|AssertionError|too large|overflow|too small|No such file|undefined reference|multiple definition" \
             build.log | head -60 || true
-          echo "== qstr count =="
-          wc -l circuitpython/ports/espressif/build-$BOARD/genhdr/qstrdefs.preprocessed.h 2>/dev/null || true
 
       - name: Upload build log
         if: always()
