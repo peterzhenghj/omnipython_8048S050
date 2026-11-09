@@ -73,7 +73,7 @@ jobs:
           grep -n "QSTR_BLOB_MAX" py/makeqstrdata.py
           grep -n "qstr_offset_t" py/qstr.h
 
-      # ===== 第 5 步（修正版）：重写分区表，app 分区 2M -> 4M =====
+      # ===== 第 5 步：重写分区表，app 分区 2048K -> 4096K =====
       - name: "Patch 2: enlarge app partitions"
         run: |
           set -e
@@ -94,38 +94,52 @@ jobs:
           echo -e "\n########## 原始 $CSV ##########" | tee -a "$LOG"
           cat "$CSV" | tee -a "$LOG"
 
-          # 2) 校验原表与 build.log 中的布局一致，不一致就停止，避免误改
-          norm() { grep -v '^[[:space:]]*#' "$1" | grep -v '^[[:space:]]*$' | tr -d ' \t' | sed 's/,$//'; }
+          # 2) 校验原表布局：去注释/空白，大小统一换算为 K（2M == 2048K）
+          norm() {
+            grep -v '^[[:space:]]*#' "$1" | grep -v '^[[:space:]]*$' | tr -d ' \t' | sed 's/,$//' \
+            | awk -F, 'BEGIN{OFS=","} {
+                s=$5
+                if (s ~ /^[0-9]+[Mm]$/)      { sub(/[Mm]$/,"",s); s=(s*1024) "K" }
+                else if (s ~ /^[0-9]+[Kk]$/) { sub(/[Kk]$/,"",s); s=s "K" }
+                $5=s; print $1,$2,$3,$4,$5 }'
+          }
           EXPECT=$(printf '%s\n' \
             "nvs,data,nvs,0x9000,20K" \
             "otadata,data,ota,0xe000,8K" \
-            "ota_0,app,ota_0,0x10000,2M" \
-            "ota_1,app,ota_1,0x210000,2M" \
+            "ota_0,app,ota_0,0x10000,2048K" \
+            "ota_1,app,ota_1,0x210000,2048K" \
             "user_fs,data,fat,0x410000,12224K")
-          if [ "$(norm "$CSV")" != "$EXPECT" ]; then
-            echo "::error::$CSV 内容与预期布局不一致，未修改。请把 partition.log 发出来。"
-            echo -e "\n预期：\n$EXPECT\n实际：\n$(norm "$CSV")" | tee -a "$LOG"
+          ACTUAL=$(norm "$CSV")
+          if [ "$ACTUAL" != "$EXPECT" ]; then
+            echo "::error::$CSV 布局与预期不一致，未修改。请把 partition.log 发出来。"
+            echo -e "\n预期：\n$EXPECT\n实际（规范化后）：\n$ACTUAL" | tee -a "$LOG"
             exit 1
           fi
+          echo -e "\n>> 原表布局校验通过" | tee -a "$LOG"
 
-          # 3) 写入新分区表（偏移已重新计算，总计 16MB）
+          # 3) 写入新分区表（偏移已重新计算，0x810000 + 8128K = 16MB）
           cat > "$CSV" <<'EOF'
-          # Name,   Type, SubType, Offset,   Size,  Flags
-          nvs,      data, nvs,     0x9000,   20K,
-          otadata,  data, ota,     0xe000,   8K,
-          ota_0,    app,  ota_0,   0x10000,  4096K,
-          ota_1,    app,  ota_1,   0x410000, 4096K,
-          user_fs,  data, fat,     0x810000, 8128K,
+          # Name,             Type,   SubType,    Offset,     Size
+          # bootloader,       app,    boot,       0x1000/0x0, 28/32K
+          # partition_table,  data,   table,      0x8000,     4K
+          nvs,                data,   nvs,        0x9000,     20K
+          otadata,            data,   ota,        0xe000,     8K
+          ota_0,              app,    ota_0,      0x10000,    4096K
+          ota_1,              app,    ota_1,      0x410000,   4096K
+          user_fs,            data,   fat,        0x810000,   8128K
           EOF
-          sed -i 's/^[[:space:]]*//' "$CSV"
+          sed -i 's/^[[:space:]]\{10\}//' "$CSV"
 
           echo -e "\n########## 修改后 $CSV ##########" | tee -a "$LOG"
           cat "$CSV" | tee -a "$LOG"
 
-          # 4) 用 ESP-IDF 自带工具离线校验（无需安装 IDF，只用其 python 脚本）
+          # 4) 用 ESP-IDF 自带工具离线校验（重叠/越界/对齐错误会直接失败）
           echo -e "\n########## gen_esp32part 校验 ##########" | tee -a "$LOG"
-          python3 esp-idf/components/partition_table/gen_esp32part.py --flash-size 16MB "$CSV" /tmp/pt.bin 2>&1 | tee -a "$LOG" \
-            || python3 esp-idf/components/partition_table/gen_esp32part.py --flash-size 16MB "$CSV" "$GITHUB_WORKSPACE/pt.bin" 2>&1 | tee -a "$LOG"
+          set -o pipefail
+          python3 esp-idf/components/partition_table/gen_esp32part.py \
+            --flash-size 16MB "$CSV" "$RUNNER_TEMP/pt.bin" 2>&1 | tee -a "$LOG"
+          python3 esp-idf/components/partition_table/gen_esp32part.py \
+            "$RUNNER_TEMP/pt.bin" 2>&1 | tee -a "$LOG"
 
       - name: Upload patch logs
         if: always()
