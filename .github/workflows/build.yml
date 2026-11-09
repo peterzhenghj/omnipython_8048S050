@@ -6,7 +6,7 @@ on:
       cp_ref:
         description: "CircuitPython tag 或分支"
         required: true
-        default: "11.0.0"
+        default: "11.0.0-alpha.2"
       board:
         description: "CircuitPython 板子名称"
         required: true
