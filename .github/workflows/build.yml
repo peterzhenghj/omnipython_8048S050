@@ -29,6 +29,8 @@ env:
   EXTRA_MAKE_ARGS: ${{ github.event.inputs.extra_make_args || '' }}
   DIAG_ONLY: ${{ github.event.inputs.diag_only || 'false' }}
   IDF_TOOLS_PATH: ${{ github.workspace }}/.idf_tools
+  # build.log 确认实际加载的 flash 配置
+  FLASH_DEFAULTS: esp-idf-config/sdkconfig-flash-16MB-no-uf2.defaults
 
 jobs:
   build:
@@ -51,51 +53,86 @@ jobs:
             https://github.com/PyDevices/omnipython-lvgl.git omnipython-lvgl
           git -C omnipython-lvgl log -1 --oneline
 
-      # ===== 第 4 步：qstr 偏移 16 位 -> 32 位 =====
-      - name: "Patch: 32-bit qstr offsets"
+      # ===== 第 4 步（已验证）：qstr 偏移 16 位 -> 32 位 =====
+      - name: "Patch 1: 32-bit qstr offsets"
         run: |
           set -e
           cd circuitpython
-          {
-            echo "########## 补丁前：qstr_offset_t 全部用法 ##########"
-            grep -rn "qstr_offset_t" py/ || echo ">> 未找到 qstr_offset_t"
-            echo
-            echo "########## 补丁前：makeqstrdata.py 上限 ##########"
-            grep -n "QSTR_BLOB_MAX" py/makeqstrdata.py
-          } | tee ../patch.log
-
-          # 1) makeqstrdata.py 上限
           n=$(grep -c "^QSTR_BLOB_MAX = 1 << 16" py/makeqstrdata.py || true)
           if [ "$n" != "1" ]; then
             echo "::error::makeqstrdata.py 中未唯一匹配 'QSTR_BLOB_MAX = 1 << 16'（匹配 $n 次）"; exit 1
           fi
           sed -i 's/^QSTR_BLOB_MAX = 1 << 16/QSTR_BLOB_MAX = 1 << 32/' py/makeqstrdata.py
 
-          # 2) qstr_offset_t 类型
           n=$(grep -cE "typedef[[:space:]]+uint16_t[[:space:]]+qstr_offset_t" py/qstr.h || true)
           if [ "$n" != "1" ]; then
-            echo "::error::py/qstr.h 中未唯一匹配 'typedef uint16_t qstr_offset_t'（匹配 $n 次），请把 patch-log 发出来"; exit 1
+            echo "::error::py/qstr.h 中未唯一匹配 'typedef uint16_t qstr_offset_t'（匹配 $n 次）"; exit 1
           fi
           sed -i -E "s/typedef([[:space:]]+)uint16_t([[:space:]]+)qstr_offset_t/typedef\1uint32_t\2qstr_offset_t/" py/qstr.h
 
-          {
-            echo
-            echo "########## 补丁后 ##########"
-            grep -n "QSTR_BLOB_MAX" py/makeqstrdata.py
-            grep -n "qstr_offset_t" py/qstr.h
-            echo
-            echo "########## 可能写死 16 位的地方（供人工检查）##########"
-            grep -rn -E "uint16_t.*(offset|blob)|(offset|blob).*uint16_t|0xffff|65535" py/qstr.c py/qstr.h || echo ">> 无"
-            echo
-            git diff --stat
-          } | tee -a ../patch.log
+          grep -n "QSTR_BLOB_MAX" py/makeqstrdata.py
+          grep -n "qstr_offset_t" py/qstr.h
 
-      - name: Upload patch log
+      # ===== 第 5 步（修正版）：重写分区表，app 分区 2M -> 4M =====
+      - name: "Patch 2: enlarge app partitions"
+        run: |
+          set -e
+          cd circuitpython/ports/espressif
+          LOG="$GITHUB_WORKSPACE/partition.log"
+
+          # 1) 找到实际使用的分区表 CSV（板子 sdkconfig 可覆盖默认值，取最后一个）
+          [ -f "$FLASH_DEFAULTS" ] || { echo "::error::$FLASH_DEFAULTS 不存在"; ls esp-idf-config/ | tee "$LOG"; exit 1; }
+          CSV=$(grep -h "^CONFIG_PARTITION_TABLE_CUSTOM_FILENAME" "$FLASH_DEFAULTS" "boards/$BOARD/sdkconfig" 2>/dev/null \
+                | tail -1 | cut -d= -f2 | tr -d '"')
+          {
+            echo "FLASH_DEFAULTS=$FLASH_DEFAULTS"
+            echo "CSV(from sdkconfig)=$CSV"
+          } | tee "$LOG"
+          [ -n "$CSV" ] || { echo "::error::未找到 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME"; cat "$FLASH_DEFAULTS" | tee -a "$LOG"; exit 1; }
+          [ -f "$CSV" ] || { echo "::error::分区表文件 $CSV 不存在（路径相对 ports/espressif）"; exit 1; }
+
+          echo -e "\n########## 原始 $CSV ##########" | tee -a "$LOG"
+          cat "$CSV" | tee -a "$LOG"
+
+          # 2) 校验原表与 build.log 中的布局一致，不一致就停止，避免误改
+          norm() { grep -v '^[[:space:]]*#' "$1" | grep -v '^[[:space:]]*$' | tr -d ' \t' | sed 's/,$//'; }
+          EXPECT=$(printf '%s\n' \
+            "nvs,data,nvs,0x9000,20K" \
+            "otadata,data,ota,0xe000,8K" \
+            "ota_0,app,ota_0,0x10000,2M" \
+            "ota_1,app,ota_1,0x210000,2M" \
+            "user_fs,data,fat,0x410000,12224K")
+          if [ "$(norm "$CSV")" != "$EXPECT" ]; then
+            echo "::error::$CSV 内容与预期布局不一致，未修改。请把 partition.log 发出来。"
+            echo -e "\n预期：\n$EXPECT\n实际：\n$(norm "$CSV")" | tee -a "$LOG"
+            exit 1
+          fi
+
+          # 3) 写入新分区表（偏移已重新计算，总计 16MB）
+          cat > "$CSV" <<'EOF'
+          # Name,   Type, SubType, Offset,   Size,  Flags
+          nvs,      data, nvs,     0x9000,   20K,
+          otadata,  data, ota,     0xe000,   8K,
+          ota_0,    app,  ota_0,   0x10000,  4096K,
+          ota_1,    app,  ota_1,   0x410000, 4096K,
+          user_fs,  data, fat,     0x810000, 8128K,
+          EOF
+          sed -i 's/^[[:space:]]*//' "$CSV"
+
+          echo -e "\n########## 修改后 $CSV ##########" | tee -a "$LOG"
+          cat "$CSV" | tee -a "$LOG"
+
+          # 4) 用 ESP-IDF 自带工具离线校验（无需安装 IDF，只用其 python 脚本）
+          echo -e "\n########## gen_esp32part 校验 ##########" | tee -a "$LOG"
+          python3 esp-idf/components/partition_table/gen_esp32part.py --flash-size 16MB "$CSV" /tmp/pt.bin 2>&1 | tee -a "$LOG" \
+            || python3 esp-idf/components/partition_table/gen_esp32part.py --flash-size 16MB "$CSV" "$GITHUB_WORKSPACE/pt.bin" 2>&1 | tee -a "$LOG"
+
+      - name: Upload patch logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: patch-log
-          path: patch.log
+          name: patch-logs
+          path: partition.log
           if-no-files-found: ignore
 
       # ===== 编译 =====
@@ -136,12 +173,14 @@ jobs:
         if: always() && env.DIAG_ONLY != 'true'
         continue-on-error: true
         run: |
-          echo "== qstr 错误 =="
-          grep -n -B3 -A8 -E "too large|AssertionError" build.log || echo "无 qstr 错误"
+          echo "== 实际生成的分区表 =="
+          grep -A9 "Partition table binary generated" build.log || echo "未找到"
+          echo "== flash 使用 =="
+          grep -n -E "bytes used.*flash firmware space|Too little flash" build.log || true
           echo "== 编译错误 =="
           grep -n -E "error:|Error [0-9]" build.log | head -30 || echo "无"
-          echo "== 固件 / 分区 =="
-          grep -n -iE "firmware.bin|overflow|too small|partition" build.log | tail -20 || true
+          echo "== 输出文件 =="
+          ls -la circuitpython/ports/espressif/build-$BOARD/firmware.* 2>/dev/null || true
 
       - name: Upload build log
         if: always() && env.DIAG_ONLY != 'true'
@@ -158,5 +197,5 @@ jobs:
           name: firmware-${{ env.BOARD }}
           path: |
             circuitpython/ports/espressif/build-${{ env.BOARD }}/firmware.bin
-            circuitpython/ports/espressif/build-${{ env.BOARD }}/firmware.uf2
+            circuitpython/ports/espressif/build-${{ env.BOARD }}/firmware.elf
           if-no-files-found: warn
