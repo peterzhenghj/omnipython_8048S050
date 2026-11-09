@@ -11,12 +11,18 @@ on:
         description: "CircuitPython 板子名称"
         required: true
         default: "sunton_esp32_8048S050"
+      diag_only:
+        description: "只运行排查步骤，不编译"
+        type: boolean
+        required: true
+        default: true
   push:
     branches: [main]
 
 env:
   CP_REF: ${{ github.event.inputs.cp_ref || '11.0.0-alpha.2' }}
   BOARD: ${{ github.event.inputs.board || 'sunton_esp32_8048S050' }}
+  DIAG_ONLY: ${{ github.event.inputs.diag_only || 'false' }}
   IDF_TOOLS_PATH: ${{ github.workspace }}/.idf_tools
 
 jobs:
@@ -40,47 +46,68 @@ jobs:
           git clone --recurse-submodules --shallow-submodules \
             https://github.com/PyDevices/omnipython-lvgl.git omnipython-lvgl
 
-      # ===== 第 1 步：排查信息（不会让 job 失败）=====
-      - name: "Diag 1: versions"
+      # ===== 第 2 步：排查信息全部写入 diag.log =====
+      - name: Collect diagnostics
         continue-on-error: true
         run: |
-          echo "CP_REF=$CP_REF  BOARD=$BOARD"
-          echo "== CircuitPython commit =="; git -C circuitpython log -1 --oneline
-          echo "== omnipython-lvgl commit =="; git -C omnipython-lvgl log -1 --oneline
-          echo "== 板子目录是否存在 =="; ls circuitpython/ports/espressif/boards/ | grep -i 8048 || echo "未找到 8048 相关板子"
+          D=diag.log
+          {
+            echo "########## 1. 版本 ##########"
+            echo "CP_REF=$CP_REF  BOARD=$BOARD"
+            git -C circuitpython log -1 --oneline
+            git -C omnipython-lvgl log -1 --oneline
 
-      - name: "Diag 2: QSTR_OFFSET_BYTES support"
-        continue-on-error: true
-        run: |
-          echo "== circuitpython/py =="
-          grep -rn "QSTR_OFFSET_BYTES" circuitpython/py || echo ">> py 中未找到"
-          echo "== circuitpython/ports/espressif =="
-          grep -rn "QSTR_OFFSET_BYTES" circuitpython/ports/espressif --include=*.h --include=*.mk --include=Makefile || echo ">> espressif 中未找到"
-          echo "== omnipython-lvgl/ports/circuitpython =="
-          grep -rn "QSTR_OFFSET_BYTES" omnipython-lvgl/ports/circuitpython || echo ">> 模块中未找到"
-          echo "== micropython.mk 全文 =="
-          cat omnipython-lvgl/ports/circuitpython/micropython.mk || true
+            echo; echo "########## 2. makeqstrdata.py 报错附近（440-522 行）##########"
+            sed -n '440,522p' circuitpython/py/makeqstrdata.py
 
-      - name: "Diag 3: qstr size limit in makeqstrdata.py"
-        continue-on-error: true
-        run: |
-          grep -n -B3 -A3 "too large" circuitpython/py/makeqstrdata.py || echo ">> 未找到 too large"
+            echo; echo "########## 3. makeqstrdata.py 中 pool / limit / offset 相关 ##########"
+            grep -n -iE "pool|too large|offset|65535|0xffff|1 *<< *16|limit" circuitpython/py/makeqstrdata.py
 
-      # ===== 编译 =====
+            echo; echo "########## 4. py/ 中 QSTR_OFFSET / QSTR_BYTES 相关定义 ##########"
+            grep -rn -E "QSTR_OFFSET|QSTR_BYTES_IN|QSTR_POOL" circuitpython/py --include=*.h --include=*.c --include=*.mk --include=*.py | head -60
+
+            echo; echo "########## 5. py.mk 中调用 makeqstrdata 的规则 ##########"
+            grep -n -B2 -A6 "makeqstrdata" circuitpython/py/py.mk
+
+            echo; echo "########## 6. espressif port 中相关设置 ##########"
+            grep -rn -E "QSTR_OFFSET|QSTR_BYTES" circuitpython/ports/espressif --include=*.h --include=*.mk --include=Makefile | grep -v "/esp-idf/" || echo ">> 未找到"
+
+            echo; echo "########## 7. omnipython-lvgl micropython.mk 全文 ##########"
+            cat -n omnipython-lvgl/ports/circuitpython/micropython.mk
+
+            echo; echo "########## 8. 板子目录文件 ##########"
+            ls -la "circuitpython/ports/espressif/boards/$BOARD" || echo ">> 板子目录不存在"
+            cat "circuitpython/ports/espressif/boards/$BOARD/mpconfigboard.mk" 2>/dev/null
+          } > "$D" 2>&1
+          cat "$D"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-log
+          path: diag.log
+          if-no-files-found: ignore
+
+      # ===== 编译（diag_only=true 时跳过）=====
       - name: Install ESP-IDF
+        if: env.DIAG_ONLY != 'true'
         run: |
           cd circuitpython/ports/espressif
           ./esp-idf/install.sh esp32s3
 
       - name: Install Python requirements
+        if: env.DIAG_ONLY != 'true'
         run: |
           source circuitpython/ports/espressif/esp-idf/export.sh
           pip install -r circuitpython/requirements-dev.txt
 
       - name: Build mpy-cross
+        if: env.DIAG_ONLY != 'true'
         run: make -C circuitpython/mpy-cross -j"$(nproc)"
 
       - name: Build firmware
+        if: env.DIAG_ONLY != 'true'
         run: |
           set -o pipefail
           source circuitpython/ports/espressif/esp-idf/export.sh
@@ -89,17 +116,8 @@ jobs:
             CIRCUITPY_GIFIO=0 \
             V=1 -j"$(nproc)" 2>&1 | tee build.log
 
-      - name: "Diag 4: qstr offset in build output"
-        if: always()
-        continue-on-error: true
-        run: |
-          echo "== build.log 中的 QSTR_OFFSET =="
-          grep -o "MICROPY_QSTR_OFFSET_BYTES[=0-9]*" build.log | sort | uniq -c || echo ">> 编译命令中未出现"
-          echo "== 错误附近 =="
-          grep -n -B5 -A5 "too large" build.log || true
-
       - name: Upload build log
-        if: always()
+        if: always() && env.DIAG_ONLY != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: build-log
@@ -107,7 +125,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Upload firmware
-        if: success()
+        if: success() && env.DIAG_ONLY != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: firmware-${{ env.BOARD }}
