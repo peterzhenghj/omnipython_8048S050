@@ -15,7 +15,7 @@ on:
     branches: [main]
 
 env:
-  CP_REF: ${{ github.event.inputs.cp_ref || '11.0.0' }}
+  CP_REF: ${{ github.event.inputs.cp_ref || '11.0.0-alpha.2' }}
   BOARD: ${{ github.event.inputs.board || 'sunton_esp32_8048S050' }}
   IDF_TOOLS_PATH: ${{ github.workspace }}/.idf_tools
 
@@ -30,6 +30,7 @@ jobs:
 
       - name: Clone CircuitPython
         run: |
+          echo "Cloning CircuitPython ref: $CP_REF"
           git clone --depth 1 --branch "$CP_REF" https://github.com/adafruit/circuitpython.git circuitpython
           cd circuitpython/ports/espressif
           make fetch-port-submodules
