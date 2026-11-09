@@ -1,127 +1,101 @@
-name: Build CircuitPython + LVGL (Sunton 8048S050)
+name: Build CircuitPython + LVGL
 
 on:
   workflow_dispatch:
     inputs:
       cp_ref:
-        description: "CircuitPython tag/branch"
-        default: "main"
-      lvgl_ref:
-        description: "omnipython-lvgl branch/tag/commit"
-        default: "main"
-      jobs:
-        description: "make -j (排查时设为 1)"
-        default: "4"
+        description: "CircuitPython tag 或分支"
+        required: true
+        default: "11.0.0"
+      board:
+        description: "CircuitPython 板子名称"
+        required: true
+        default: "sunton_esp32_8048S050"
+  push:
+    branches: [main]
+
+env:
+  CP_REF: ${{ github.event.inputs.cp_ref || '11.0.0' }}
+  BOARD: ${{ github.event.inputs.board || 'sunton_esp32_8048S050' }}
+  IDF_TOOLS_PATH: ${{ github.workspace }}/.idf_tools
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
-    env:
-      BOARD: sunton_esp32_8048S050
-      LVGL_MOD: ${{ github.workspace }}/omnipython-lvgl/ports/circuitpython
-    defaults:
-      run:
-        shell: bash   # -eo pipefail
-
     steps:
-      - name: Checkout CircuitPython
-        uses: actions/checkout@v4
-        with:
-          repository: adafruit/circuitpython
-          ref: ${{ inputs.cp_ref }}
-          path: circuitpython
-          fetch-depth: 0
-
-      - name: Checkout omnipython-lvgl
-        uses: actions/checkout@v4
-        with:
-          repository: PyDevices/omnipython-lvgl
-          ref: ${{ inputs.lvgl_ref }}
-          path: omnipython-lvgl
-          submodules: recursive
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: System packages
+      - name: Install system packages
         run: |
           sudo apt-get update
           sudo apt-get install -y gettext cmake ninja-build ccache libusb-1.0-0
 
-      - name: Show versions
+      - name: Clone CircuitPython
         run: |
-          echo "CircuitPython: $(git -C circuitpython describe --tags --always)"
-          echo "omnipython-lvgl: $(git -C omnipython-lvgl rev-parse --short HEAD)"
+          git clone --depth 1 --branch "$CP_REF" https://github.com/adafruit/circuitpython.git circuitpython
+          cd circuitpython/ports/espressif
+          make fetch-port-submodules
 
-      - name: Show omnipython-lvgl CI hints
+      - name: Clone omnipython-lvgl
         run: |
-          ls -la omnipython-lvgl/.github/workflows/ 2>/dev/null || echo "(no workflows)"
-          grep -rnE "adafruit/circuitpython|ref:|\.patch|git apply|makeqstrdata" \
-            omnipython-lvgl/.github/workflows/ omnipython-lvgl/ports/circuitpython/ 2>/dev/null \
-            | head -40 || true
+          git clone --recurse-submodules --shallow-submodules \
+            https://github.com/PyDevices/omnipython-lvgl.git omnipython-lvgl
 
-      - name: Apply omnipython-lvgl patches (if any)
+      # ===== 第 1 步：排查信息（不会让 job 失败）=====
+      - name: "Diag 1: versions"
+        continue-on-error: true
         run: |
-          cd circuitpython
-          shopt -s nullglob
-          patches=()
-          for d in "$GITHUB_WORKSPACE/omnipython-lvgl/ports/circuitpython" \
-                   "$GITHUB_WORKSPACE/omnipython-lvgl/ports/circuitpython/patches" \
-                   "$GITHUB_WORKSPACE/omnipython-lvgl/patches"; do
-            patches+=("$d"/*.patch "$d"/*.diff)
-          done
-          [ ${#patches[@]} -eq 0 ] && { echo "No patches found, skip."; exit 0; }
-          for p in "${patches[@]}"; do
-            echo ">> applying $p"
-            git apply --check "$p" && git apply "$p"
-          done
+          echo "CP_REF=$CP_REF  BOARD=$BOARD"
+          echo "== CircuitPython commit =="; git -C circuitpython log -1 --oneline
+          echo "== omnipython-lvgl commit =="; git -C omnipython-lvgl log -1 --oneline
+          echo "== 板子目录是否存在 =="; ls circuitpython/ports/espressif/boards/ | grep -i 8048 || echo "未找到 8048 相关板子"
 
-      - name: Dump makeqstrdata pool logic
+      - name: "Diag 2: QSTR_OFFSET_BYTES support"
+        continue-on-error: true
         run: |
-          cd circuitpython
-          git log --oneline -3 -- py/makeqstrdata.py
-          echo "----- makeqstrdata.py 440-505 -----"
-          sed -n '440,505p' py/makeqstrdata.py
-          echo "----- qstr.h / qstr.c -----"
-          grep -rnE "QSTR_POOL|qstr_pool|MICROPY_QSTR_BYTES|total_qstr" py/qstr.h py/qstr.c | head -20 || true
+          echo "== circuitpython/py =="
+          grep -rn "QSTR_OFFSET_BYTES" circuitpython/py || echo ">> py 中未找到"
+          echo "== circuitpython/ports/espressif =="
+          grep -rn "QSTR_OFFSET_BYTES" circuitpython/ports/espressif --include=*.h --include=*.mk --include=Makefile || echo ">> espressif 中未找到"
+          echo "== omnipython-lvgl/ports/circuitpython =="
+          grep -rn "QSTR_OFFSET_BYTES" omnipython-lvgl/ports/circuitpython || echo ">> 模块中未找到"
+          echo "== micropython.mk 全文 =="
+          cat omnipython-lvgl/ports/circuitpython/micropython.mk || true
 
-      - name: Cache ESP-IDF tools
-        uses: actions/cache@v4
-        with:
-          path: ~/.espressif
-          key: idf-${{ runner.os }}-${{ inputs.cp_ref }}
-
-      - name: Fetch espressif submodules
+      - name: "Diag 3: qstr size limit in makeqstrdata.py"
+        continue-on-error: true
         run: |
-          for i in 1 2 3; do
-            make -C circuitpython/ports/espressif fetch-port-submodules && break
-            echo "retry $i"; sleep 10
-          done
+          grep -n -B3 -A3 "too large" circuitpython/py/makeqstrdata.py || echo ">> 未找到 too large"
 
-      - name: Install ESP-IDF + Python deps
+      # ===== 编译 =====
+      - name: Install ESP-IDF
         run: |
-          cd circuitpython
-          pip install -r requirements-dev.txt
-          ./ports/espressif/esp-idf/install.sh esp32s3
+          cd circuitpython/ports/espressif
+          ./esp-idf/install.sh esp32s3
 
-      - name: Build
+      - name: Install Python requirements
         run: |
-          cd circuitpython
-          source ports/espressif/esp-idf/export.sh
-          pip install -r requirements-dev.txt
-          make -C ports/espressif -j${{ inputs.jobs }} \
-            BOARD=$BOARD \
+          source circuitpython/ports/espressif/esp-idf/export.sh
+          pip install -r circuitpython/requirements-dev.txt
+
+      - name: Build mpy-cross
+        run: make -C circuitpython/mpy-cross -j"$(nproc)"
+
+      - name: Build firmware
+        run: |
+          set -o pipefail
+          source circuitpython/ports/espressif/esp-idf/export.sh
+          make -C circuitpython/ports/espressif BOARD="$BOARD" \
+            USER_C_MODULES="$GITHUB_WORKSPACE/omnipython-lvgl/ports/circuitpython" \
             CIRCUITPY_GIFIO=0 \
-            USER_C_MODULES=$LVGL_MOD \
-            2>&1 | tee $GITHUB_WORKSPACE/build.log
+            V=1 -j"$(nproc)" 2>&1 | tee build.log
 
-      - name: Show errors
-        if: failure()
+      - name: "Diag 4: qstr offset in build output"
+        if: always()
+        continue-on-error: true
         run: |
-          grep -nE "error:|Error [0-9]|AssertionError|too large|overflow|too small|No such file|undefined reference|multiple definition" \
-            build.log | head -60 || true
+          echo "== build.log 中的 QSTR_OFFSET =="
+          grep -o "MICROPY_QSTR_OFFSET_BYTES[=0-9]*" build.log | sort | uniq -c || echo ">> 编译命令中未出现"
+          echo "== 错误附近 =="
+          grep -n -B5 -A5 "too large" build.log || true
 
       - name: Upload build log
         if: always()
@@ -129,12 +103,13 @@ jobs:
         with:
           name: build-log
           path: build.log
+          if-no-files-found: ignore
 
       - name: Upload firmware
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: circuitpython-lvgl-${{ env.BOARD }}
+          name: firmware-${{ env.BOARD }}
           path: |
             circuitpython/ports/espressif/build-${{ env.BOARD }}/firmware.bin
             circuitpython/ports/espressif/build-${{ env.BOARD }}/firmware.uf2
