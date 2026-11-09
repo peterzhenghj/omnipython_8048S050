@@ -4,19 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       cp_ref:
-        description: "CircuitPython tag 或分支（需支持 MICROPY_QSTR_OFFSET_BYTES）"
+        description: "CircuitPython tag 或分支"
         required: true
-        default: "main"
+        default: "11.0.0-alpha.2"
       board:
         description: "CircuitPython 板子名称"
         required: true
         default: "sunton_esp32_8048S050"
       extra_make_args:
-        description: "额外 make 参数，例如 CIRCUITPY_BLEIO=0（方案 B 用，默认留空）"
+        description: "额外 make 参数（默认留空）"
         required: false
         default: ""
       diag_only:
-        description: "只运行检查，不编译"
+        description: "只打补丁并检查，不编译"
         type: boolean
         required: true
         default: false
@@ -24,7 +24,7 @@ on:
     branches: [main]
 
 env:
-  CP_REF: ${{ github.event.inputs.cp_ref || 'main' }}
+  CP_REF: ${{ github.event.inputs.cp_ref || '11.0.0-alpha.2' }}
   BOARD: ${{ github.event.inputs.board || 'sunton_esp32_8048S050' }}
   EXTRA_MAKE_ARGS: ${{ github.event.inputs.extra_make_args || '' }}
   DIAG_ONLY: ${{ github.event.inputs.diag_only || 'false' }}
@@ -51,29 +51,51 @@ jobs:
             https://github.com/PyDevices/omnipython-lvgl.git omnipython-lvgl
           git -C omnipython-lvgl log -1 --oneline
 
-      # ===== 第 3 步关键检查：CircuitPython 是否支持 4 字节 qstr 偏移 =====
-      - name: "Gate: MICROPY_QSTR_OFFSET_BYTES support"
+      # ===== 第 4 步：qstr 偏移 16 位 -> 32 位 =====
+      - name: "Patch: 32-bit qstr offsets"
         run: |
+          set -e
+          cd circuitpython
           {
-            echo "CP_REF=$CP_REF"
-            git -C circuitpython log -1 --format='%h %cd %s' --date=short
-            echo "== py/ 中的 QSTR_OFFSET =="
-            grep -rn "QSTR_OFFSET" circuitpython/py || true
-            echo "== makeqstrdata.py 上限定义 =="
-            grep -n -E "QSTR_BLOB_MAX|OFFSET_BYTES" circuitpython/py/makeqstrdata.py || true
-          } | tee gate.log
-          if ! grep -rq "MICROPY_QSTR_OFFSET_BYTES" circuitpython/py; then
-            echo "::error::CircuitPython '$CP_REF' 不支持 MICROPY_QSTR_OFFSET_BYTES，qstr 池仍为 64KB 上限，编译必然失败。请换版本或使用方案 B。"
-            exit 1
-          fi
-          echo "OK: '$CP_REF' 支持 MICROPY_QSTR_OFFSET_BYTES"
+            echo "########## 补丁前：qstr_offset_t 全部用法 ##########"
+            grep -rn "qstr_offset_t" py/ || echo ">> 未找到 qstr_offset_t"
+            echo
+            echo "########## 补丁前：makeqstrdata.py 上限 ##########"
+            grep -n "QSTR_BLOB_MAX" py/makeqstrdata.py
+          } | tee ../patch.log
 
-      - name: Upload gate log
+          # 1) makeqstrdata.py 上限
+          n=$(grep -c "^QSTR_BLOB_MAX = 1 << 16" py/makeqstrdata.py || true)
+          if [ "$n" != "1" ]; then
+            echo "::error::makeqstrdata.py 中未唯一匹配 'QSTR_BLOB_MAX = 1 << 16'（匹配 $n 次）"; exit 1
+          fi
+          sed -i 's/^QSTR_BLOB_MAX = 1 << 16/QSTR_BLOB_MAX = 1 << 32/' py/makeqstrdata.py
+
+          # 2) qstr_offset_t 类型
+          n=$(grep -cE "typedef[[:space:]]+uint16_t[[:space:]]+qstr_offset_t" py/qstr.h || true)
+          if [ "$n" != "1" ]; then
+            echo "::error::py/qstr.h 中未唯一匹配 'typedef uint16_t qstr_offset_t'（匹配 $n 次），请把 patch-log 发出来"; exit 1
+          fi
+          sed -i -E "s/typedef([[:space:]]+)uint16_t([[:space:]]+)qstr_offset_t/typedef\1uint32_t\2qstr_offset_t/" py/qstr.h
+
+          {
+            echo
+            echo "########## 补丁后 ##########"
+            grep -n "QSTR_BLOB_MAX" py/makeqstrdata.py
+            grep -n "qstr_offset_t" py/qstr.h
+            echo
+            echo "########## 可能写死 16 位的地方（供人工检查）##########"
+            grep -rn -E "uint16_t.*(offset|blob)|(offset|blob).*uint16_t|0xffff|65535" py/qstr.c py/qstr.h || echo ">> 无"
+            echo
+            git diff --stat
+          } | tee -a ../patch.log
+
+      - name: Upload patch log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gate-log
-          path: gate.log
+          name: patch-log
+          path: patch.log
           if-no-files-found: ignore
 
       # ===== 编译 =====
@@ -110,15 +132,15 @@ jobs:
             $EXTRA_MAKE_ARGS \
             V=1 -j"$(nproc)" 2>&1 | tee build.log
 
-      - name: "Diag: qstr / size summary"
+      - name: "Diag: build summary"
         if: always() && env.DIAG_ONLY != 'true'
         continue-on-error: true
         run: |
-          echo "== qstr 相关错误 ==" 
+          echo "== qstr 错误 =="
           grep -n -B3 -A8 -E "too large|AssertionError" build.log || echo "无 qstr 错误"
-          echo "== 编译命令中的 OFFSET_BYTES =="
-          grep -o "MICROPY_QSTR_OFFSET_BYTES=[0-9]*" build.log | sort | uniq -c || true
-          echo "== 固件大小 / 分区检查 =="
+          echo "== 编译错误 =="
+          grep -n -E "error:|Error [0-9]" build.log | head -30 || echo "无"
+          echo "== 固件 / 分区 =="
           grep -n -iE "firmware.bin|overflow|too small|partition" build.log | tail -20 || true
 
       - name: Upload build log
